@@ -1,16 +1,23 @@
-import os
 import logging
-import asyncio
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import os
 import random
 import string
 import uuid
-import urllib.parse
+from io import BytesIO
+from contextlib import contextmanager
+
 import telegram
+import qrcode
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, func
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from dotenv import load_dotenv
+
+from models import User, GameHistory, Transaction
+from ton_interaction import get_exchange_rate, deposit_ton, deposit_dice, withdraw_ton, withdraw_dice
+from locales import get_message
 
 load_dotenv()
 
@@ -23,246 +30,140 @@ if not BOT_TOKEN:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_db_connection():
-    return psycopg2.connect(DB_URL, sslmode='require', cursor_factory=RealDictCursor)
+engine = create_engine(DB_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def create_tables():
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id TEXT UNIQUE,
-                username TEXT,
-                invite_code TEXT UNIQUE,
-                balance INTEGER DEFAULT 1000,
-                inviter_id INTEGER REFERENCES users(id),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        # 检查 updated_at 列是否存在，如果不存在则添加
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='updated_at'")
-        if cur.fetchone() is None:
-            cur.execute("ALTER TABLE users ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        
-        cur.execute('''
-    CREATE TABLE IF NOT EXISTS game_history (
-        id SERIAL PRIMARY KEY,
-        game_id TEXT,
-        player_a_id INTEGER REFERENCES users(id),
-        player_b_id INTEGER REFERENCES users(id),
-        bet_amount INTEGER,
-        player_a_score INTEGER,
-        player_b_score INTEGER,
-        winner_id INTEGER REFERENCES users(id),
-        win_amount INTEGER,
-        status TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-    conn.commit()
-    conn.close()
+@contextmanager
+def get_db_session():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 def get_user_by_id(user_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
-        return user
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching user by ID: {e}")
-        return None
-    finally:
-        conn.close()
+    with get_db_session() as session:
+        return session.query(User).filter(User.id == user_id).first()
+
+def update_user_wallet(user_id, wallet_address):
+    with get_db_session() as session:
+        user = session.query(User).filter(User.id == user_id).first()
+        if user:
+            user.wallet_address = wallet_address
+            session.commit()
 
 def get_user_by_telegram_id(telegram_id):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-        user = cur.fetchone()
-    conn.close()
-    return user
+    with get_db_session() as session:
+        return session.query(User).filter(User.telegram_id == telegram_id).first()
 
 def get_user_by_invite_code(invite_code):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE UPPER(invite_code) = UPPER(%s)", (invite_code,))
-            user = cur.fetchone()
+    with get_db_session() as session:
+        user = session.query(User).filter(func.upper(User.invite_code) == func.upper(invite_code)).first()
         return user
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching user by invite code: {e}")
-        return None
-    finally:
-        conn.close()
-
+    
 def create_user(telegram_id, username, inviter_id=None):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO users (telegram_id, username, inviter_id, balance, created_at, updated_at) 
-                VALUES (%s, %s, %s, 1000, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING *""",
-                (telegram_id, username, inviter_id)
-            )
-            new_user = cur.fetchone()
-        conn.commit()
+    with get_db_session() as session:
+        new_user = User(
+            telegram_id=telegram_id,
+            username=username,
+            inviter_id=inviter_id,
+            balance=1000
+        )
+        session.add(new_user)
+        session.commit()
         return new_user
-    except psycopg2.Error as e:
-        logger.error(f"Error creating user: {e}")
-        conn.rollback()
-        return None
-    finally:
-        conn.close()
 
 def generate_invite_code(user_id):
     invite_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET invite_code = %s WHERE id = %s",
-                (invite_code, user_id)
-            )
-        conn.commit()
-        return invite_code
-    except psycopg2.Error as e:
-        logger.error(f"Error generating invite code: {e}")
-        conn.rollback()
-        return None
-    finally:
-        conn.close()
+    with get_db_session() as session:
+        user = session.query(User).filter(User.id == user_id).first()
+        if user:
+            user.invite_code = invite_code
+            session.commit()
+    return invite_code
 
 def update_user_balance(telegram_id, amount, is_invite_earning=False):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
+    with get_db_session() as session:
+        user = session.query(User).filter(User.telegram_id == telegram_id).first()
+        if user:
+            user.balance += amount
             if is_invite_earning:
-                cur.execute("""
-                    UPDATE users 
-                    SET balance = balance + %s, 
-                        invite_earnings = invite_earnings + %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE telegram_id = %s
-                """, (amount, amount, telegram_id))
-            else:
-                cur.execute("""
-                    UPDATE users 
-                    SET balance = balance + %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE telegram_id = %s
-                """, (amount, telegram_id))
-        conn.commit()
-    except psycopg2.Error as e:
-        logger.error(f"Error updating user balance: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
+                user.invite_earnings = (user.invite_earnings or 0) + amount
+            session.commit()
 
 def add_game_history(game_id, player_a_id, player_b_id, bet_amount, player_a_score, player_b_score, winner_id, win_amount, status):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO game_history (game_id, player_a_id, player_b_id, bet_amount, player_a_score, player_b_score, winner_id, win_amount, status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """, (game_id, player_a_id, player_b_id, bet_amount, player_a_score, player_b_score, winner_id, win_amount, status))
-        conn.commit()
-        logger.info(f"Added game history: game_id={game_id}, player_a_id={player_a_id}, player_b_id={player_b_id}, status={status}")
-    except psycopg2.Error as e:
-        conn.rollback()
-        logger.error(f"Error adding game history: {e}")
-    finally:
-        conn.close()
-
-async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    # 清理游戏数据
-    if 'game_id' in context.user_data:
-        game_id = context.user_data['game_id']
-        if game_id in context.bot_data.get('pending_games', {}):
-            del context.bot_data['pending_games'][game_id]
-
-    # 重置用户数据
-    context.user_data.clear()
-    context.user_data['game_state'] = 'idle'
-
-    await query.edit_message_text("游戏已取消。", reply_markup=create_main_menu())
+    with get_db_session() as session:
+        new_game = GameHistory(
+            game_id=game_id,
+            player_a_id=player_a_id,
+            player_b_id=player_b_id,
+            bet_amount=bet_amount,
+            player_a_score=player_a_score,
+            player_b_score=player_b_score,
+            winner_id=winner_id,
+            win_amount=win_amount,
+            status=status
+        )
+        session.add(new_game)
+        session.commit()
 
 def get_user_game_history(user_id, status='completed', limit=5, offset=0):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT gh.*, 
-                       ua.username as player_a_username, 
-                       ub.username as player_b_username
-                FROM game_history gh
-                LEFT JOIN users ua ON gh.player_a_id = ua.id
-                LEFT JOIN users ub ON gh.player_b_id = ub.id
-                WHERE (gh.player_a_id = %s OR gh.player_b_id = %s)
-                  AND gh.status = %s
-                ORDER BY gh.created_at DESC
-                LIMIT %s OFFSET %s
-            """, (user_id, user_id, status, limit, offset))
-            game_history = cur.fetchall()
-        return game_history
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching user game history: {e}")
-        return []
-    finally:
-        conn.close()
+    with get_db_session() as session:
+        return session.query(GameHistory).filter(
+            ((GameHistory.player_a_id == user_id) | (GameHistory.player_b_id == user_id)) &
+            (GameHistory.status == status)
+        ).order_by(GameHistory.created_at.desc()).limit(limit).offset(offset).all()
 
 def get_invited_users(user_id):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE inviter_id = %s", (user_id,))
-        invited_users = cur.fetchall()
-    conn.close()
-    return invited_users
+    with get_db_session() as session:
+        invited_users = session.query(User).filter(User.inviter_id == user_id).all()
+        return invited_users
 
 def calculate_invite_earnings(user_id):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT SUM(win_amount) * 0.07 as earnings
-            FROM game_history
-            JOIN users ON game_history.winner_id = users.id
-            WHERE users.inviter_id = %s
-        """, (user_id,))
-        earnings = cur.fetchone()['earnings'] or 0
-    conn.close()
-    return earnings
+    with get_db_session() as session:
+        earnings = session.query(func.sum(GameHistory.win_amount * 0.07)).join(User, GameHistory.winner_id == User.id).filter(User.inviter_id == user_id).scalar() or 0
+        return earnings
+
+def get_wallet_address(user_id):
+    with get_db_session() as session:
+        user = session.query(User).filter(User.id == user_id).first()
+        return user.wallet_address if user else None
+    
+def update_user_info(telegram_id, username):
+    with get_db_session() as session:
+        user = session.query(User).filter(User.telegram_id == telegram_id).first()
+        if user:
+            user.username = username
+            user.updated_at = func.now()
+            session.commit()
 
 def create_main_menu():
     keyboard = [
         [InlineKeyboardButton("🎮 开始游戏", callback_data='start_game')],
         [InlineKeyboardButton("📜 对战历史", callback_data='game_history')],
-        [InlineKeyboardButton("🔗 邀约收益", callback_data='invite_earnings')],  # 修改这里
-        [InlineKeyboardButton("💰 余额", callback_data='balance')],
-        [InlineKeyboardButton("❓ 帮助", callback_data='help')]
+        [InlineKeyboardButton("🔗 邀约收益", callback_data='invite_earnings')],
+        [InlineKeyboardButton("💰 游戏余额", callback_data='balance')],
+        [InlineKeyboardButton("💱 充值/提现", callback_data='deposit_withdraw')],  # 新的合并按钮
+        [InlineKeyboardButton("🔗 连接钱包", callback_data='connect_wallet')],
+        [InlineKeyboardButton("❓ 帮助中心", callback_data='help')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def update_user_info(telegram_id, username):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET username = %s, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = %s",
-                (username, telegram_id)
-            )
-        conn.commit()
-    except psycopg2.Error as e:
-        logger.error(f"Error updating user info: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
+    with get_db_session() as session:
+        try:
+            user = session.query(User).filter(User.telegram_id == telegram_id).first()
+            if user:
+                user.username = username
+                user.updated_at = func.now()
+                session.commit()
+        except SQLAlchemyError as e:
+            logger.error(f"Error updating user info: {e}")
+            session.rollback()
 
 def create_game_share_button(game_id, bot_username):
     return InlineKeyboardButton(
@@ -300,12 +201,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             del context.user_data['pending_game_id']
         else:
             await update.message.reply_text(
-                f"欢迎回来,{user['username']}！您的当前余额是：{user['balance']} 游戏币。",
+                f"欢迎回来,{user.username}！您的当前余额是：{user.balance} 游戏币。",
                 reply_markup=create_main_menu()
             )
     else:
         await update.message.reply_text("请输入邀请码完成注册,注册后可获得1000空投游戏币：", reply_markup=create_main_menu())
         context.user_data['awaiting_invite_code'] = True
+
 
 async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_id: str) -> None:
     user = get_user_by_telegram_id(str(update.effective_user.id))
@@ -353,10 +255,10 @@ async def handle_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     try:
-        new_user = create_user(telegram_id, username, inviter['id'])
+        new_user = create_user(telegram_id, username, inviter.id)
         if new_user:
             logger.info(f"User {telegram_id} registered successfully")
-            welcome_message = f"注册成功！您已通过 @{inviter['username']} 的邀请获得了1000游戏币。"
+            welcome_message = f"注册成功！您已通过 @{inviter.username} 的邀请获得了1000游戏币。"
             await update.message.reply_text(welcome_message, reply_markup=create_main_menu())
             context.user_data['awaiting_invite_code'] = False
             
@@ -379,14 +281,154 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         await query.edit_message_text("未找到您的账户信息，请先注册。", reply_markup=create_main_menu())
 
+async def show_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    contract_address = "EQA..."  # DICE 代币合约地址
+    total_supply = 1_000_000_000  # 总供应量
+    circulating_supply = 10_000_000  # 流通量（初始 1%）
+
+    info_text = (
+        f"DICE 代币信息：\n\n"
+        f"合约地址：`{contract_address}`\n"
+        f"总供应量：{total_supply:,} DICE\n"
+        f"流通量：{circulating_supply:,} DICE\n\n"
+        f"买卖规则：\n"
+        f"1. 每笔交易必须是 10,000 DICE\n"
+        f"2. 买入：向合约地址发送相应数量的 TON\n"
+        f"3. 卖出：向合约发送 10,000 DICE\n"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("返回主菜单", callback_data='main_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(info_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+import html
+import urllib.parse
+
+async def check_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = get_user_by_telegram_id(str(query.from_user.id))
+    
+    # 这里应该检查用户的充值状态
+    # 假设我们有一个函数来检查充值状态
+    deposit_status = await check_user_deposit_status(user['id'])
+    
+    if deposit_status['completed']:
+        await query.edit_message_text(f"充值已完成。您的新余额是: {user['balance'] + deposit_status['amount']} DICE")
+        update_user_balance(user['telegram_id'], deposit_status['amount'])
+    else:
+        await query.edit_message_text("充值尚未完成,请稍后再查询。")
+
+async def start_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text("请输入您要提现的金额(DICE):")
+    context.user_data['awaiting_withdraw_amount'] = True
+
+async def show_game_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    rules_text = (
+        "游戏规则:\n"
+        "1. 每局游戏需要两名玩家参与\n"
+        "2. 每位玩家轮流投掷3次骰子\n"
+        "3. 总点数高的玩家获胜\n"
+        "4. 赢家获得奖池的90%\n"
+        "5. 项目方收取3%的手续费\n"
+        "6. 邀请人可获得7%的奖励"
+    )
+    
+    await query.edit_message_text(rules_text, reply_markup=create_main_menu())
+
+async def show_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    faq_text = (
+        "常见问题:\n"
+        "Q: 如何充值?\n"
+        "A: 在主菜单中选择'充值/提现'选项,然后选择充值方式。\n\n"
+        "Q: 如何邀请朋友?\n"
+        "A: 在主菜单中选择'邀约收益'选项,获取您的邀请码。\n\n"
+        "Q: 游戏币和 DICE 代币有什么区别?\n"
+        "A: 游戏币用于游戏内下注,DICE 代币可以在 TON 网络上交易。\n\n"
+        "Q: 如何提现?\n"
+        "A: 在主菜单中选择'充值/提现'选项,然后选择提现方式。"
+    )
+    
+    await query.edit_message_text(faq_text, reply_markup=create_main_menu())
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    
+    if query.data == 'start_game':
+        await start_game(update, context)
+    elif query.data == 'game_history':
+        await show_game_history(update, context)
+    elif query.data == 'invite_earnings':
+        await show_invite_earnings(update, context)
+    elif query.data == 'balance':
+        await show_balance(update, context)
+    elif query.data == 'deposit_withdraw':
+        await show_deposit_withdraw_options(update, context)
+    elif query.data == 'game_rules':
+        await show_game_rules(update, context)
+    elif query.data == 'faq':
+        await show_faq(update, context)
+    elif query.data.startswith('confirm_'):
+        await confirm_transaction(update, context)
+    elif query.data == 'cancel_transaction':
+        await cancel_transaction(update, context)
+    elif query.data == 'connect_wallet':
+        await connect_wallet(update, context)
 
     if query.data == 'start_game':
         await start_game(update, context)
     elif query.data == 'game_history':
         await show_game_history(update, context)
+    elif query.data == 'invite_earnings':
+        await show_invite_earnings(update, context)
+    elif query.data == 'balance':
+        await show_balance(update, context)
+    elif query.data == 'deposit_withdraw':
+        await deposit_withdraw(update, context)
+    elif query.data == 'connect_wallet':
+        await connect_wallet(update, context)
+    elif query.data == 'help':
+        await show_help(update, context)
+    elif query.data == 'main_menu':
+        await show_menu(update, context)
+    elif query.data == 'deposit_ton':
+        await deposit_ton_handler(update, context)
+    elif query.data == 'deposit_dice':
+        await deposit_dice_handler(update, context)
+    elif query.data == 'withdraw_ton':
+        await withdraw_ton_handler(update, context)
+    elif query.data == 'withdraw_dice':
+        await withdraw_dice_handler(update, context)
+    elif query.data == 'token_info':
+        await show_token_info(update, context)
+    elif query.data == 'check_deposit':
+        await check_deposit(update, context)
+    elif query.data == 'start_withdraw':
+        await start_withdraw(update, context)
+    elif query.data == 'game_rules':
+        await show_game_rules(update, context)
+    elif query.data == 'faq':
+        await show_faq(update, context)
+    elif query.data == 'main_menu':
+        await show_menu(update, context)
+    elif query.data == 'cancel_game':
+        await cancel_game(update, context)
     elif query.data.startswith('history_'):
         _, action, page = query.data.split('_')
         page = int(page)
@@ -396,21 +438,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await show_game_history(update, context, page + 1)
         elif action == 'refresh':
             await show_game_history(update, context, page)
-    elif query.data == 'invite_earnings':
-        await show_invite_earnings(update, context)
-    elif query.data == 'balance':
-        await show_balance(update, context)
-    elif query.data == 'help':
-        await show_help(update, context)
-    elif query.data == 'cancel_game':
-        await cancel_game(update, context)
-    elif query.data == 'main_menu':
-        await show_menu(update, context)
     else:
         await query.edit_message_text("未知的操作。", reply_markup=create_main_menu())
 
-import html
-import urllib.parse
+async def show_deposit_withdraw_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("充值 TON", callback_data='deposit_ton'),
+         InlineKeyboardButton("充值 DICE", callback_data='deposit_dice')],
+        [InlineKeyboardButton("提现 TON", callback_data='withdraw_ton'),
+         InlineKeyboardButton("提现 DICE", callback_data='withdraw_dice')],
+        [InlineKeyboardButton("返回主菜单", callback_data='main_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.edit_message_text("请选择充值或提现方式:", reply_markup=reply_markup)
 
 async def show_game_history(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0) -> None:
     query = update.callback_query
@@ -528,12 +568,171 @@ async def show_pending_games(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=True)
 
+async def connect_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    connection_id = str(uuid.uuid4())
+    connect_url = f"https://app.tonkeeper.com/ton-connect?id={connection_id}"
+    
+    qr = qrcode.make(connect_url)
+    qr_io = BytesIO()
+    qr.save(qr_io, 'PNG')
+    qr_io.seek(0)
+    
+    keyboard = [
+        [InlineKeyboardButton("我已完成连接", callback_data=f'check_wallet_{connection_id}')],
+        [InlineKeyboardButton("取消", callback_data='cancel_wallet_connection')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=qr_io,
+        caption="请使用TON钱包扫描此QR码来连接您的钱包。完成后点击下方按钮。",
+        reply_markup=reply_markup
+    )
+
+async def check_wallet_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    connection_id = query.data.split('_')[-1]
+    
+    try:
+        wallet_address = await get_wallet_address(connection_id)  # 这个函数需要实现
+        if wallet_address:
+            user = get_user_by_telegram_id(str(query.from_user.id))
+            update_user_wallet(user['id'], wallet_address)
+            await query.edit_message_text(f"钱包连接成功! 地址: {wallet_address[:6]}...{wallet_address[-4:]}")
+        else:
+            await query.edit_message_text("钱包连接失败,请重试。", reply_markup=create_main_menu())
+    except Exception as e:
+        logger.error(f"Wallet connection error: {e}")
+        await query.edit_message_text("连接过程中发生错误,请重试或联系客服。", reply_markup=create_main_menu())
+
+async def wallet_connected(update: Update, context: ContextTypes.DEFAULT_TYPE, wallet_address: str):
+    user = get_user_by_telegram_id(str(update.effective_user.id))
+    
+    # 更新用户的钱包地址
+    update_user_wallet(user['id'], wallet_address)
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"钱包连接成功! 地址: {wallet_address[:6]}...{wallet_address[-4:]}"
+    )
+
+async def deposit_ton_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    exchange_rate = await get_exchange_rate()
+    ton_amount = exchange_rate / 1e9
+    await update.callback_query.edit_message_text(
+        f"您将使用 {ton_amount:.6f} TON 购买 10,000 DICE。请确认交易。",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("确认", callback_data='confirm_deposit_ton'),
+            InlineKeyboardButton("取消", callback_data='cancel_transaction')
+        ]])
+    )
+
+async def deposit_dice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        "您将存入 10,000 DICE。请确认交易。",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("确认", callback_data='confirm_deposit_dice'),
+            InlineKeyboardButton("取消", callback_data='cancel_transaction')
+        ]])
+    )
+
+async def withdraw_ton_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    exchange_rate = await get_exchange_rate()
+    ton_amount = exchange_rate / 1e9
+    await update.callback_query.edit_message_text(
+        f"您将出售 10,000 DICE 以获得 {ton_amount:.6f} TON。请确认交易。",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("确认", callback_data='confirm_withdraw_ton'),
+            InlineKeyboardButton("取消", callback_data='cancel_transaction')
+        ]])
+    )
+
+async def withdraw_dice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        "您将提取 10,000 DICE。请确认交易。",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("确认", callback_data='confirm_withdraw_dice'),
+            InlineKeyboardButton("取消", callback_data='cancel_transaction')
+        ]])
+    )
+
+async def confirm_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split('_')[1:]
+    user = get_user_by_telegram_id(str(query.from_user.id))
+    
+    try:
+        if action[1] == 'deposit':
+            if action[2] == 'ton':
+                result = await deposit_ton(context.user_data['wallet'])
+                if result.success:
+                    update_user_balance(user['telegram_id'], result.amount)
+            else:
+                result = await deposit_dice(context.user_data['wallet'])
+                if result.success:
+                    update_user_balance(user['telegram_id'], result.amount)
+        else:  # withdraw
+            if action[2] == 'ton':
+                result = await withdraw_ton(context.user_data['wallet'])
+                if result.success:
+                    update_user_balance(user['telegram_id'], -result.amount)
+            else:
+                result = await withdraw_dice(context.user_data['wallet'])
+                if result.success:
+                    update_user_balance(user['telegram_id'], -result.amount)
+        
+        if result.success:
+            await query.edit_message_text(f"交易成功！您的新余额是: {user['balance']}")
+        else:
+            await query.edit_message_text("交易失败，请重试。")
+    except Exception as e:
+        logger.error(f"Transaction error: {e}")
+        await query.edit_message_text("交易过程中发生错误，请重试或联系客服。")
+    
+    # 清除用户数据
+    context.user_data.clear()
+
+async def check_user_deposit_status(user_id):
+    # 这里应该实现检查用户充值状态的逻辑
+    # 返回一个字典，包含 'completed' 和 'amount' 键
+    return {'completed': False, 'amount': 0}  # 示例返回值
+
+async def show_transaction_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = get_user_by_telegram_id(str(query.from_user.id))
+    
+    with get_db_session() as session:
+        transactions = session.query(Transaction).filter_by(user_id=user.id).order_by(Transaction.created_at.desc()).limit(10).all()
+    
+    if not transactions:
+        await query.edit_message_text("您还没有任何交易记录。", reply_markup=create_main_menu())
+        return
+    
+    message = "您的最近10笔交易记录:\n\n"
+    for tx in transactions:
+        message += f"{tx.created_at.strftime('%Y-%m-%d %H:%M')} - {tx.type.capitalize()} {tx.amount} DICE - {tx.status.capitalize()}\n"
+    
+    await query.edit_message_text(message, reply_markup=create_main_menu())
+
+
+async def cancel_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("交易已取消。", reply_markup=create_main_menu())
+    context.user_data.clear()
+
 async def show_completed_games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user_by_telegram_id(str(user_id))
     
-    completed_games = get_user_completed_games(user['id'])
+    completed_games = get_user_completed_games(user.id)
     
     if not completed_games:
         await query.edit_message_text("您没有已完成的游戏记录。", reply_markup=create_main_menu())
@@ -541,16 +740,16 @@ async def show_completed_games(update: Update, context: ContextTypes.DEFAULT_TYP
 
     message = "您的游戏历史记录：\n\n"
     for game in completed_games:
-        opponent = game['player_a_id'] == user['id'] and game['player_b_username'] or game['player_a_username']
-        user_score = game['player_a_id'] == user['id'] and game['player_a_score'] or game['player_b_score']
-        opponent_score = game['player_a_id'] == user['id'] and game['player_b_score'] or game['player_a_score']
-        result = game['winner_id'] == user['id'] and "胜利" or "失败"
+        opponent = game.player_b.username if game.player_a_id == user.id else game.player_a.username
+        user_score = game.player_a_score if game.player_a_id == user.id else game.player_b_score
+        opponent_score = game.player_b_score if game.player_a_id == user.id else game.player_a_score
+        result = "胜利" if game.winner_id == user.id else "失败"
         
         message += f"🎮 对手: {opponent}\n"
-        message += f"   下注金额: {game['bet_amount']} 游戏币\n"
+        message += f"   下注金额: {game.bet_amount} 游戏币\n"
         message += f"   得分: {user_score} - {opponent_score}\n"
         message += f"   结果: {result}\n"
-        message += f"   时间: {game['created_at']}\n\n"
+        message += f"   时间: {game.created_at}\n\n"
 
     keyboard = [
         [InlineKeyboardButton("返回", callback_data='game_history')],
@@ -569,45 +768,33 @@ def create_invite_message(user, game, context):
     )
 
 def get_user_pending_games(user_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT * FROM game_history
-                WHERE player_a_id = %s AND player_b_id IS NULL AND status = 'pending'
-                ORDER BY created_at DESC
-            """, (user_id,))
-            pending_games = cur.fetchall()
-        return pending_games
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching user pending games: {e}")
-        return []
-    finally:
-        conn.close()
+    with get_db_session() as session:
+        try:
+            pending_games = session.query(GameHistory).filter(
+                GameHistory.player_a_id == user_id,
+                GameHistory.player_b_id == None,
+                GameHistory.status == 'pending'
+            ).order_by(GameHistory.created_at.desc()).all()
+            return pending_games
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching user pending games: {e}")
+            return []
 
 def get_user_completed_games(user_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT gh.*, 
-                       ua.username as player_a_username, 
-                       ub.username as player_b_username
-                FROM game_history gh
-                LEFT JOIN users ua ON gh.player_a_id = ua.id
-                LEFT JOIN users ub ON gh.player_b_id = ub.id
-                WHERE (gh.player_a_id = %s OR gh.player_b_id = %s)
-                  AND gh.status = 'completed'
-                ORDER BY gh.created_at DESC
-                LIMIT 10
-            """, (user_id, user_id))
-            completed_games = cur.fetchall()
-        return completed_games
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching user completed games: {e}")
-        return []
-    finally:
-        conn.close()
+    with get_db_session() as session:
+        try:
+            completed_games = session.query(GameHistory, User.username.label('player_a_username'), User.username.label('player_b_username')).join(
+                User, GameHistory.player_a_id == User.id, isouter=True
+            ).join(
+                User, GameHistory.player_b_id == User.id, isouter=True
+            ).filter(
+                ((GameHistory.player_a_id == user_id) | (GameHistory.player_b_id == user_id)) &
+                (GameHistory.status == 'completed')
+            ).order_by(GameHistory.created_at.desc()).limit(10).all()
+            return completed_games
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching user completed games: {e}")
+            return []
 
 async def show_invite_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -629,41 +816,44 @@ async def show_invite_earnings(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await query.edit_message_text("未找到您的账户信息，请先注册。", reply_markup=create_main_menu())
         
-async def process_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 这里需要实现实际的充值逻辑
-    deposit_successful = False  # 这应该根据实际充值结果来设置
-    if deposit_successful:
-        user = get_user_by_telegram_id(str(update.effective_user.id))
-        if not user['invite_code']:
-            invite_code = generate_invite_code(user['id'])
-            await update.message.reply_text(f"充值成功！您的专属邀请码是: {invite_code}", reply_markup=create_main_menu())
-        else:
-            await update.message.reply_text("充值成功！", reply_markup=create_main_menu())
-    else:
-        await update.message.reply_text("充值失败，请稍后重试或联系客服。", reply_markup=create_main_menu())
-
-async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 这里需要实现实际的提现逻辑
-    withdrawal_successful = False  # 这应该根据实际提现结果来设置
-    if withdrawal_successful:
-        user = get_user_by_telegram_id(str(update.effective_user.id))
-        if not user['invite_code']:
-            invite_code = generate_invite_code(user['id'])
-            await update.message.reply_text(f"提现成功！您的专属邀请码是: {invite_code}", reply_markup=create_main_menu())
-        else:
-            await update.message.reply_text("提现成功！", reply_markup=create_main_menu())
-    else:
-        await update.message.reply_text("提现失败，请稍后重试或联系客服。", reply_markup=create_main_menu())
+async def deposit_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    exchange_rate = await get_exchange_rate()  # 假设这个函数从智能合约获取当前汇率
+    ton_amount = exchange_rate / 1e9  # 将nanotons转换为TON
+    
+    keyboard = [
+        [InlineKeyboardButton(f"使用 TON 充值 ({ton_amount:.6f} TON)", callback_data='deposit_ton')],
+        [InlineKeyboardButton("使用 10,000 DICE 充值", callback_data='deposit_dice')],
+        [InlineKeyboardButton(f"提现为 TON ({ton_amount:.6f} TON)", callback_data='withdraw_ton')],
+        [InlineKeyboardButton("提现为 10,000 DICE", callback_data='withdraw_dice')],
+        [InlineKeyboardButton("返回主菜单", callback_data='main_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.callback_query.edit_message_text("请选择充值或提现方式：", reply_markup=reply_markup)
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
     help_text = (
-        "游戏规则和帮助：\n"
-        "1. 注册后获得1000游戏币空投\n"
-        "2. 在1v1挖矿中下注，赢家获得奖励\n"
-        "3. 邀请朋友使用您的邀请码注册，获得额外奖励\n"
-        "如需更多帮助，请联系客服。"
+        "🎮 游戏规则：\n"
+        "1. 每局游戏需要两名玩家参与\n"
+        "2. 每位玩家轮流投掷3次骰子\n"
+        "3. 总点数高的玩家获胜\n"
+        "4. 赢家获得奖池的90%\n\n"
+        "💰 如何赚钱：\n"
+        "1. 参与游戏并获胜\n"
+        "2. 邀请好友注册，获得他们游戏收益的7%\n"
+        "3. 持有 DICE 代币，参与项目增值\n\n"
+        "如需更多帮助，请联系客服：@customer_service"
     )
-    await update.callback_query.edit_message_text(help_text, reply_markup=create_main_menu())
+
+    keyboard = [
+        [InlineKeyboardButton("返回主菜单", callback_data='main_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(help_text, reply_markup=reply_markup)
 
 async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -961,17 +1151,21 @@ def main() -> None:
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(button_callback))
         application.add_handler(MessageHandler(filters.Dice.ALL, handle_dice))
-        
-        application.add_handler(MessageHandler(filters.ALL, show_menu))
 
+        application.add_handler(CallbackQueryHandler(confirm_transaction, pattern='^confirm_'))
+        application.add_handler(CallbackQueryHandler(cancel_transaction, pattern='^cancel_transaction$'))
+        application.add_handler(CallbackQueryHandler(connect_wallet, pattern='^connect_wallet$'))
+        
         application.add_error_handler(error_handler)
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"Error in main: {e}")
 
-if __name__ == '__main__':
-    create_tables()
+if __name__ == "__main__":
     main()
+
+
+
 
 
 

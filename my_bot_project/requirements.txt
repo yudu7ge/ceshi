@@ -1,2 +1,5 @@
-   tonsdk
-   python-telegram-bot
+python-telegram-bot==20.3
+python-dotenv==1.0.0
+psycopg2-binary==2.9.6
+tonsdk==1.0.13
+tonconnect==0.1.1
